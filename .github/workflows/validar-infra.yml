@@ -1,0 +1,105 @@
+# =============================================================================
+# Workflow: validar-infra
+# Repositório: kiro-loja-infra
+#
+# Objetivo: ser o portão de qualidade (gate) antes do merge na main.
+# Roda em todo Pull Request com destino à branch main e executa dois checks:
+#
+#   1. cfn-lint  — valida a sintaxe e as regras do template CloudFormation,
+#                  detectando erros de tipo, propriedades inválidas, recursos
+#                  obsoletos e desvios das boas práticas da AWS.
+#
+#   2. Checkov   — faz scan de segurança e conformidade (IaC security),
+#                  identificando configurações de risco como portas abertas,
+#                  criptografia ausente, logs desabilitados, etc.
+#
+# Se qualquer um dos dois steps falhar, o workflow falha e bloqueia o merge.
+# O CloudFormation Git Sync só implanta mudanças que chegam à main, portanto
+# este workflow garante que apenas código validado e aprovado seja implantado.
+#
+# Para ativar como status check obrigatório:
+#   GitHub → Settings → Branches → Branch protection rules → main
+#   → "Require status checks to pass before merging"
+#   → adicionar o job "validar" como check obrigatório.
+# =============================================================================
+
+name: validar-infra
+
+# -----------------------------------------------------------------------------
+# Gatilho: Pull Requests com destino à branch main.
+# O workflow roda nos eventos opened, synchronize (novo commit no PR) e
+# reopened — cobrindo todo o ciclo de vida de um PR.
+# -----------------------------------------------------------------------------
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validar:
+    name: Lint e scan de segurança — foundation.yaml
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # Faz o clone do repositório no runner para que os passos seguintes
+      # tenham acesso aos arquivos do PR.
+      # -----------------------------------------------------------------------
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Instalar cfn-lint
+      # cfn-lint é a ferramenta oficial da AWS para validar templates
+      # CloudFormation. Verifica: sintaxe YAML, tipos de propriedades,
+      # recursos e propriedades inexistentes, funções intrínsecas mal usadas,
+      # regiões não suportadas e regras de boas práticas (prefixo W).
+      # -----------------------------------------------------------------------
+      - name: Instalar cfn-lint
+        run: pip install cfn-lint
+
+      # -----------------------------------------------------------------------
+      # 3. Executar cfn-lint no template
+      # Flags:
+      #   -t  caminho do template a ser validado
+      #   --include-checks W  inclui avisos (warnings) além dos erros,
+      #                       tornando o gate mais rigoroso.
+      # O step falha (exit code != 0) se houver erros ou avisos, bloqueando
+      # o merge do PR automaticamente.
+      # -----------------------------------------------------------------------
+      - name: Validar foundation.yaml com cfn-lint
+        run: cfn-lint -t foundation.yaml --include-checks W
+
+      # -----------------------------------------------------------------------
+      # 4. Instalar Checkov
+      # Checkov é um scanner estático de IaC (Infrastructure as Code) que
+      # verifica templates CloudFormation contra centenas de políticas de
+      # segurança e conformidade (CIS, NIST, PCI-DSS, HIPAA, etc.).
+      # Exemplos de checks: SGs com 0.0.0.0/0, buckets S3 públicos,
+      # logs desabilitados, criptografia ausente, IMDSv1 habilitado.
+      # -----------------------------------------------------------------------
+      - name: Instalar Checkov
+        run: pip install checkov
+
+      # -----------------------------------------------------------------------
+      # 5. Executar Checkov no template
+      # Flags:
+      #   -f   arquivo a ser analisado
+      #   --framework cloudformation  limita o scan ao framework CFN
+      #   --quiet  suprime output de checks aprovados; mostra apenas falhas
+      #   --compact  output resumido, mais legível nos logs do Actions
+      #
+      # Checkov falha (exit code 1) se encontrar qualquer check com status
+      # FAILED, bloqueando o merge.
+      #
+      # Para suprimir um check específico após avaliação consciente de risco,
+      # use a flag --skip-check CKV_AWS_XXX (documente o motivo no PR).
+      # -----------------------------------------------------------------------
+      - name: Scan de segurança com Checkov
+        run: |
+          checkov \
+            -f foundation.yaml \
+            --framework cloudformation \
+            --quiet \
+            --compact

@@ -13,6 +13,9 @@ criados por esta camada.
 
 ```
 kiro-loja-infra/
+├── .github/
+│   └── workflows/
+│       └── validar-infra.yml        # Workflow de validação e scan (gate de qualidade)
 ├── foundation.yaml                  # Template CloudFormation da camada de fundação
 └── kiro-loja-infra-implantar.yaml   # Arquivo de implantação do Git Sync (prod)
 ```
@@ -70,6 +73,41 @@ Valores atuais:
 | `VpcCidr` | `10.0.0.0/16` |
 | `Project` (tag) | `kiro-loja` |
 | `Environment` (tag) | `prod` |
+
+---
+
+### `.github/workflows/validar-infra.yml`
+
+Workflow do GitHub Actions que atua como **portão de qualidade (gate)** antes do merge
+na `main`. Como o CloudFormation Git Sync implanta automaticamente qualquer mudança que
+chega à `main`, este workflow garante que apenas código validado e seguro seja
+implantado.
+
+**Quando roda:** em todo Pull Request com destino à branch `main` — nos eventos de
+abertura, novo commit e reabertura do PR.
+
+**O que executa:**
+
+| Step | Ferramenta | O que verifica |
+|---|---|---|
+| Lint do template | **cfn-lint** | Sintaxe YAML, tipos de propriedades, recursos inválidos, funções intrínsecas mal usadas e boas práticas AWS (erros + avisos) |
+| Scan de segurança | **Checkov** | Configurações de risco: portas abertas para `0.0.0.0/0`, criptografia ausente, logs desabilitados, políticas permissivas (CIS, NIST, PCI-DSS) |
+
+**Comportamento ao falhar:** se qualquer um dos dois steps falhar, o workflow falha e
+o merge fica bloqueado. O PR só pode ser aprovado após a correção dos problemas
+apontados.
+
+**Papel no fluxo completo:**
+
+```
+PR aberto → validar-infra roda → aprovado → merge na main → Git Sync implanta
+                                  ↑
+                         gate obrigatório
+```
+
+Para ativar como check obrigatório, acesse:
+`GitHub → Settings → Branches → Branch protection rules → main`
+→ *Require status checks to pass before merging* → adicione o job **`validar`**.
 
 ---
 
