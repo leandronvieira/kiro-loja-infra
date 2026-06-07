@@ -1,0 +1,504 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stack de fundação do projeto kiro-loja.
+  Contém apenas infraestrutura compartilhada: VPC, subnets, gateways,
+  ALB, security groups, cluster ECS (Fargate) e repositórios ECR.
+  Nenhum serviço de aplicação é criado aqui.
+
+# =============================================================================
+# PARÂMETROS
+# Valores que podem ser sobrescritos no momento do deploy sem alterar o template.
+# =============================================================================
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: kiro-loja
+    Description: >
+      Nome do projeto. Usado como prefixo em todos os recursos e tags,
+      garantindo rastreabilidade e evitando conflitos de nome entre projetos.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >
+      Bloco CIDR da VPC. Deve ser um /16 para ter espaço suficiente para
+      dividir em subnets públicas e privadas por zona de disponibilidade.
+
+# =============================================================================
+# RECURSOS
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # VPC
+  # Rede virtual isolada que abriga todos os recursos do projeto.
+  # DNS habilitado para que os recursos possam resolver nomes internos da AWS
+  # (ex: endpoints de serviços, nomes de tasks ECS).
+  # ---------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # SUBNETS PÚBLICAS (2 zonas de disponibilidade)
+  # Recursos nestas subnets recebem IP público e têm acesso direto à internet
+  # via Internet Gateway. Usadas pelo ALB.
+  # Fn::Select + Fn::GetAZs garantem que as AZs sejam resolvidas dinamicamente
+  # para a região onde o stack for implantado.
+  # ---------------------------------------------------------------------------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-a"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-b"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # SUBNETS PRIVADAS (2 zonas de disponibilidade)
+  # Recursos nestas subnets NÃO têm IP público. O acesso à internet de saída
+  # é feito via NAT Gateway. Usadas pelas tasks ECS (Fargate).
+  # ---------------------------------------------------------------------------
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-a"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-b"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # INTERNET GATEWAY
+  # Permite comunicação bidirecional entre as subnets públicas e a internet.
+  # Precisa ser associado (attached) à VPC para funcionar.
+  # ---------------------------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # ELASTIC IP + NAT GATEWAY
+  # O NAT Gateway fica em UMA subnet pública e permite que recursos das subnets
+  # privadas iniciem conexões de saída para a internet (ex: pull de imagens ECR,
+  # chamadas a APIs externas) sem ficarem expostos a conexões de entrada.
+  # ATENÇÃO: Um único NAT Gateway é suficiente para dev/staging e reduz custos.
+  # Em produção com alta disponibilidade, considere um NAT Gateway por AZ.
+  # ---------------------------------------------------------------------------
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat-eip"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # ROUTE TABLE PÚBLICA
+  # Rota padrão (0.0.0.0/0) aponta para o Internet Gateway.
+  # Associada às duas subnets públicas.
+  # ---------------------------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rtb-public"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------------------------
+  # ROUTE TABLE PRIVADA
+  # Rota padrão (0.0.0.0/0) aponta para o NAT Gateway.
+  # Associada às duas subnets privadas.
+  # ---------------------------------------------------------------------------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rtb-private"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP DO ALB
+  # Permite tráfego HTTP (porta 80) de qualquer origem na internet.
+  #
+  # EM PRODUÇÃO: Remova a regra de porta 80 e adicione uma regra para porta 443
+  # (HTTPS). Idealmente, mantenha a 80 apenas para redirecionar para 443
+  # via listener de redirecionamento (não um security group — isso é feito
+  # no listener do ALB).
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-alb-sg"
+      GroupDescription: Permite HTTP da internet para o ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # HTTP — porta 80 aberta para a internet
+        # EM PRODUÇÃO: substitua por HTTPS (porta 443) com certificado ACM
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP publico (substituir por HTTPS/443 em producao)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Saida irrestrita
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP DAS TASKS ECS
+  # Aceita tráfego SOMENTE vindo do security group do ALB.
+  # Isso garante que as tasks nunca fiquem diretamente expostas à internet —
+  # todo o tráfego de entrada obrigatoriamente passa pelo ALB.
+  # ---------------------------------------------------------------------------
+  EcsTasksSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-ecs-tasks-sg"
+      GroupDescription: Permite trafego apenas vindo do ALB para as tasks ECS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Aceita qualquer porta vinda do SG do ALB.
+        # Os serviços individuais abrirão suas portas específicas nos seus
+        # próprios stacks quando registrarem seus target groups.
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Trafego do ALB para as tasks ECS
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Saida irrestrita (necessario para pull de imagens ECR via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ecs-tasks-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # APPLICATION LOAD BALANCER (ALB)
+  # Voltado para a internet (scheme: internet-facing), nas subnets públicas.
+  # Recebe o tráfego externo e distribui para os serviços via regras de
+  # roteamento por path (ex: /pedidos/* → serviço de pedidos).
+  # Os stacks de serviço adicionarão suas próprias regras neste listener.
+  # ---------------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # LISTENER HTTP (porta 80)
+  # Ponto de entrada do ALB. A ação padrão retorna 404 fixo para qualquer
+  # requisição que não corresponda às regras dos serviços.
+  # Isso é intencional: cada stack de serviço adicionará suas próprias
+  # ListenerRules com condição de path (ex: path-pattern: /pedidos/*).
+  #
+  # EM PRODUÇÃO:
+  #   1. Crie um certificado no ACM (AWS Certificate Manager) para seu domínio.
+  #   2. Substitua a porta 80 por 443 e o protocolo por HTTPS.
+  #   3. Adicione a propriedade Certificates com o ARN do certificado ACM.
+  #   4. Adicione um segundo listener na porta 80 com ação de redirecionamento
+  #      para HTTPS (redirect 301), sem necessidade de alterar os SGs.
+  # ---------------------------------------------------------------------------
+  AlbHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80          # EM PRODUÇÃO: trocar para 443
+      Protocol: HTTP    # EM PRODUÇÃO: trocar para HTTPS e adicionar Certificates
+      DefaultActions:
+        # Resposta fixa 404: qualquer path sem regra de serviço retorna não encontrado.
+        # Evita expor erros internos ou roteamento indesejado.
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: application/json
+            MessageBody: '{"error": "rota nao encontrada"}'
+
+  # ---------------------------------------------------------------------------
+  # CLUSTER ECS (Fargate)
+  # Cluster lógico que agrupa os serviços Fargate do projeto.
+  # Capacidade FARGATE e FARGATE_SPOT habilitadas: SPOT reduz custos em até 70%
+  # para cargas tolerantes a interrupções; FARGATE é o fallback estável.
+  # Container Insights ativado para métricas e logs centralizados no CloudWatch.
+  # ---------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1         # Garante pelo menos 1 task em FARGATE estável
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 3       # Prefere SPOT para tasks adicionais (mais barato)
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled  # Habilita métricas detalhadas de CPU/memória por container
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cluster"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # REPOSITÓRIOS ECR
+  # Cada serviço tem seu próprio repositório para isolamento de imagens.
+  # imageScanningConfiguration: scanOnPush realiza análise de vulnerabilidades
+  # automaticamente a cada push, usando o Amazon Inspector por baixo dos panos.
+  # ---------------------------------------------------------------------------
+
+  # Repositório do serviço de pedidos
+  EcrRepoPedidos:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/pedidos"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE  # Permite sobrescrever tags (ex: latest)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}/pedidos"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Repositório do serviço de pagamento
+  EcrRepoPagamento:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/pagamento"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}/pagamento"
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# Exportações para uso via Fn::ImportValue nos stacks de serviço.
+# Todos os nomes de export seguem o padrão: {ProjectName}-{recurso}
+# para evitar colisões entre stacks de projetos diferentes na mesma conta.
+# =============================================================================
+Outputs:
+
+  # --- Rede ---
+
+  VpcId:
+    Description: ID da VPC do projeto
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ProjectName}-VpcId"
+
+  PublicSubnetAId:
+    Description: ID da subnet publica na primeira AZ
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnetA"
+
+  PublicSubnetBId:
+    Description: ID da subnet publica na segunda AZ
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnetB"
+
+  PrivateSubnetAId:
+    Description: ID da subnet privada na primeira AZ
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnetA"
+
+  PrivateSubnetBId:
+    Description: ID da subnet privada na segunda AZ
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnetB"
+
+  # --- Security Groups ---
+
+  AlbSecurityGroupId:
+    Description: ID do security group do ALB
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-AlbSecurityGroupId"
+
+  EcsTasksSecurityGroupId:
+    Description: ID do security group das tasks ECS
+    Value: !Ref EcsTasksSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-EcsTasksSecurityGroupId"
+
+  # --- ALB ---
+
+  AlbDnsName:
+    Description: DNS publico do ALB (use para criar registros CNAME/ALIAS no Route 53)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${ProjectName}-AlbDnsName"
+
+  AlbListenerArn:
+    Description: ARN do listener HTTP do ALB (stacks de servico adicionam ListenerRules aqui)
+    Value: !Ref AlbHttpListener
+    Export:
+      Name: !Sub "${ProjectName}-AlbListenerArn"
+
+  # --- ECS ---
+
+  EcsClusterName:
+    Description: Nome do cluster ECS Fargate
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub "${ProjectName}-EcsClusterName"
+
+  # --- ECR ---
+
+  EcrRepoPedidosUri:
+    Description: URI do repositorio ECR do servico de pedidos
+    Value: !GetAtt EcrRepoPedidos.RepositoryUri
+    Export:
+      Name: !Sub "${ProjectName}-EcrRepoPedidosUri"
+
+  EcrRepoPagamentoUri:
+    Description: URI do repositorio ECR do servico de pagamento
+    Value: !GetAtt EcrRepoPagamento.RepositoryUri
+    Export:
+      Name: !Sub "${ProjectName}-EcrRepoPagamentoUri"

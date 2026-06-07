@@ -1,0 +1,62 @@
+# =============================================================================
+# ARQUIVO DE IMPLANTAÇÃO — CloudFormation Git Sync
+# Projeto: kiro-loja | Stack: kiro-loja-foundation | Ambiente: prod
+#
+# Este é o "deployment file" lido pelo Git Sync do CloudFormation.
+# Ele NÃO é um template CloudFormation — não contém Resources nem Outputs.
+# Sua função é declarar ONDE está o template e COM QUAIS valores implantá-lo.
+#
+# Separação de responsabilidades:
+#   foundation.yaml          → o TEMPLATE: define o QUE será criado (recursos AWS).
+#                              Reutilizável: pode ser implantado em qualquer ambiente.
+#   kiro-loja-infra-implantar.yaml → este arquivo: define o COMO e COM QUE valores.
+#                              É a "config por ambiente" — um arquivo diferente
+#                              existiria para staging, dev, etc., apontando para
+#                              o mesmo template com parâmetros distintos.
+#
+# Funcionamento do Git Sync:
+#   O CloudFormation monitora este arquivo e o template no repositório Git.
+#   Qualquer commit que altere um deles dispara automaticamente uma atualização
+#   da stack, sem necessidade de acionar o deploy manualmente.
+#
+# Formato oficial: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/git-sync-concepts-terms.html
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# template-file-path
+# Caminho relativo à raiz do repositório onde o template CloudFormation está.
+# O Git Sync usa este caminho para localizar o arquivo que define os recursos.
+# Altere este campo se o template for movido para uma subpasta (ex: templates/).
+# -----------------------------------------------------------------------------
+template-file-path: foundation.yaml
+
+# -----------------------------------------------------------------------------
+# parameters
+# Valores fornecidos aos parâmetros declarados no template (seção Parameters).
+# Cada chave aqui deve corresponder exatamente ao nome de um parâmetro do
+# template. Para criar um ambiente diferente (ex: staging), bastaria copiar
+# este arquivo e ajustar os valores abaixo — o template permanece intocado.
+# Limite: até 50 parâmetros por arquivo de implantação.
+# -----------------------------------------------------------------------------
+parameters:
+  # Nome do projeto: usado como prefixo em todos os recursos e exports da stack.
+  ProjectName: kiro-loja
+
+  # Bloco CIDR da VPC. Em ambientes paralelos (staging/dev), use CIDRs distintos
+  # para evitar conflito de roteamento caso as VPCs precisem de peering.
+  VpcCidr: 10.0.0.0/16
+
+# -----------------------------------------------------------------------------
+# tags
+# Tags aplicadas a todos os recursos criados pela stack.
+# Úteis para rastreamento de custos, auditoria e políticas de governança (SCP).
+# Estas tags complementam as tags individuais definidas dentro do template.
+# Limite: até 50 tags por arquivo de implantação.
+# -----------------------------------------------------------------------------
+tags:
+  # Identifica o projeto ao qual os recursos pertencem.
+  Project: kiro-loja
+
+  # Identifica o ambiente de implantação.
+  # Valores típicos: prod | staging | dev | sandbox
+  Environment: prod
